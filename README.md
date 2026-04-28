@@ -9,7 +9,7 @@
 本地仓库安装：
 
 ```bash
-./install.sh
+bash install.sh
 ```
 
 发布到 GitHub 后，可以改成一条命令安装：
@@ -141,7 +141,7 @@ yach auth status
 改动后先跑最小检查：
 
 ```bash
-./tests/smoke.sh
+bash tests/smoke.sh
 ```
 
 ## 安全说明
