@@ -18,7 +18,11 @@
 curl -fsSL https://raw.githubusercontent.com/<org>/yach-cli/main/install.sh | bash
 ```
 
-发布前需要把 `install.sh` 里的默认 `YACH_REPO` 从 `your-org/yach-cli` 改成真实仓库名。
+当前仓库的一键安装命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zpygo1/yachcli/main/install.sh | bash
+```
 
 安装后确认：
 

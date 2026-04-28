@@ -23,5 +23,4 @@ Next:
   yach init
   yach doctor
 
-If you publish this repo, set YACH_REPO in install.sh first.
 EOF
