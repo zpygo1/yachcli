@@ -1,0 +1,738 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+DEFAULT_BASE_URL="https://yach-oapi.zhiyinlou.com"
+
+CONFIG_DIR="${YACH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/yach}"
+CONFIG_FILE="${YACH_CONFIG_FILE:-$CONFIG_DIR/config.json}"
+CACHE_DIR="${YACH_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/yach}"
+TOKEN_CACHE="${YACH_TOKEN_CACHE:-$CACHE_DIR/token.json}"
+TMP_DIR="${YACH_TMP_DIR:-${TMPDIR:-/tmp}}"
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_arg() {
+  local name="$1"
+  local value="${2:-}"
+  [ -n "$value" ] || die "missing required argument: $name"
+}
+
+require_bin() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+json_quote() {
+  python3 - "$1" <<'PY'
+import json, sys
+print(json.dumps(sys.argv[1], ensure_ascii=False))
+PY
+}
+
+config_get() {
+  local key="$1"
+  [ -f "$CONFIG_FILE" ] || return 0
+  python3 - "$CONFIG_FILE" "$key" <<'PY'
+import json, sys
+path, key = sys.argv[1:3]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+value = data.get(key, "")
+if value is None:
+    value = ""
+print(value)
+PY
+}
+
+config_write() {
+  mkdir -p "$CONFIG_DIR"
+  python3 - "$CONFIG_FILE" "$@" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+pairs = sys.argv[2:]
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+for item in pairs:
+    key, value = item.split("=", 1)
+    if value:
+        data[key] = value
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PY
+  chmod 600 "$CONFIG_FILE"
+}
+
+get_setting() {
+  local env_name="$1"
+  local config_key="$2"
+  local fallback="${3:-}"
+  local env_value="${!env_name:-}"
+  if [ -n "$env_value" ]; then
+    printf '%s' "$env_value"
+    return
+  fi
+  local config_value
+  config_value="$(config_get "$config_key")"
+  if [ -n "$config_value" ]; then
+    printf '%s' "$config_value"
+    return
+  fi
+  printf '%s' "$fallback"
+}
+
+base_url() {
+  get_setting YACH_BASE_URL base_url "$DEFAULT_BASE_URL"
+}
+
+app_key() {
+  get_setting YACH_APP_KEY app_key ""
+}
+
+app_secret() {
+  get_setting YACH_APP_SECRET app_secret ""
+}
+
+default_admin_work_code() {
+  get_setting YACH_DEFAULT_ADMIN_WORK_CODE default_admin_work_code ""
+}
+
+curl_request() {
+  local tmp output status=0
+  mkdir -p "$TMP_DIR"
+  tmp="$(mktemp "${TMP_DIR%/}/yach-curl-XXXXXX")"
+  output="$(/usr/bin/curl -sS --connect-timeout 5 --max-time 30 "$@" 2>"$tmp")" || status=$?
+  if [ "$status" -ne 0 ]; then
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    return "$status"
+  fi
+  rm -f "$tmp"
+  printf '%s' "$output"
+}
+
+pretty_json() {
+  python3 -m json.tool
+}
+
+ensure_json() {
+  local raw="$1"
+  local label="$2"
+  if [ -z "$raw" ]; then
+    printf '%s failed: empty response\n' "$label" >&2
+    return 1
+  fi
+  if ! printf '%s' "$raw" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; then
+    printf '%s failed: non-JSON response\n' "$label" >&2
+    printf '%s\n' "$raw" | head -c 400 >&2
+    printf '\n' >&2
+    return 1
+  fi
+}
+
+post_form() {
+  local path="$1"
+  shift
+  curl_request -X POST "$(base_url)$path" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    "$@" | pretty_json
+}
+
+post_json_raw() {
+  local path="$1"
+  local payload="$2"
+  curl_request -X POST "$(base_url)$path" \
+    -H "Content-Type: application/json" \
+    -d "$payload"
+}
+
+token_expired() {
+  [ -f "$TOKEN_CACHE" ] || return 0
+  python3 - "$TOKEN_CACHE" <<'PY'
+import json, sys, time
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    raise SystemExit(0)
+expired = int(data.get("expired_time") or 0)
+token = data.get("access_token") or ""
+raise SystemExit(1 if token and expired > int(time.time()) else 0)
+PY
+}
+
+cached_token() {
+  python3 - "$TOKEN_CACHE" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(data.get("access_token", ""))
+PY
+}
+
+get_token() {
+  require_bin python3
+  local key secret url resp
+  key="$(app_key)"
+  secret="$(app_secret)"
+  [ -n "$key" ] || die "Yach app key is not configured. Run: yach init"
+  [ -n "$secret" ] || die "Yach app secret is not configured. Run: yach init"
+  mkdir -p "$CACHE_DIR"
+  if ! token_expired; then
+    cached_token
+    return
+  fi
+  url="$(base_url)/gettoken?appkey=${key}&appsecret=${secret}"
+  resp="$(curl_request "$url")" || die "failed to reach Yach OpenAPI"
+  ensure_json "$resp" "get token" || return 1
+  python3 - "$TOKEN_CACHE" "$resp" <<'PY'
+import json, sys
+path, raw = sys.argv[1:3]
+data = json.loads(raw)
+obj = data.get("obj") or {}
+token = obj.get("access_token") or ""
+if not token:
+    print(json.dumps(data, ensure_ascii=False, indent=2), file=sys.stderr)
+    raise SystemExit(1)
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(obj, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+print(token)
+PY
+  chmod 600 "$TOKEN_CACHE"
+}
+
+target_json_field() {
+  python3 - "$1" <<'PY'
+import json, sys
+target = sys.argv[1]
+if target.startswith("http"):
+    print(json.dumps({"file_url": target}, ensure_ascii=False))
+else:
+    print(json.dumps({"guid": target}, ensure_ascii=False))
+PY
+}
+
+extract_doc_target() {
+  python3 - "$1" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+obj = data.get("obj") or {}
+for key in ("url", "file_url", "doc_url", "guid"):
+    value = obj.get(key) if isinstance(obj, dict) else ""
+    if value:
+        print(value)
+        break
+PY
+}
+
+json_value() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+path = sys.argv[2].split(".")
+cur = data
+for key in path:
+    if isinstance(cur, dict):
+        cur = cur.get(key, "")
+    else:
+        cur = ""
+        break
+print(cur if cur is not None else "")
+PY
+}
+
+build_doc_permission_payload() {
+  local token="$1" target="$2" kind="$3" work_code="$4" role="${5:-editor}"
+  local field
+  field="$(target_json_field "$target")"
+  python3 - "$token" "$field" "$kind" "$work_code" "$role" <<'PY'
+import json, sys
+token, field_raw, kind, work_code, role = sys.argv[1:6]
+payload = {"access_token": token}
+payload.update(json.loads(field_raw))
+if kind == "admin":
+    payload["admin_work_code"] = work_code
+else:
+    payload["collaborators"] = [{
+        "work_code": work_code,
+        "role": role,
+        "user_type": 0,
+        "depart_id": 0,
+    }]
+print(json.dumps(payload, ensure_ascii=False))
+PY
+}
+
+add_doc_admin() {
+  local token="$1" target="$2" work_code="$3"
+  local payload resp
+  payload="$(build_doc_permission_payload "$token" "$target" admin "$work_code")"
+  resp="$(post_json_raw "/openapi/v2/doc/admin/add" "$payload")" || return 1
+  ensure_json "$resp" "add doc admin" || return 1
+  printf '%s' "$resp" | pretty_json
+}
+
+add_doc_collaborator() {
+  local token="$1" target="$2" work_code="$3" role="${4:-editor}"
+  local payload resp
+  payload="$(build_doc_permission_payload "$token" "$target" collaborator "$work_code" "$role")"
+  resp="$(post_json_raw "/openapi/v2/doc/collaborator/add" "$payload")" || return 1
+  ensure_json "$resp" "add doc collaborator" || return 1
+  printf '%s' "$resp" | pretty_json
+}
+
+print_doc_content() {
+  python3 - "$1" <<'PY'
+import json, sys
+raw = sys.argv[1]
+try:
+    data = json.loads(raw)
+except Exception:
+    print(raw)
+    raise SystemExit(0)
+if data.get("code") not in (0, 200, "0", "200", None):
+    print(json.dumps(data, ensure_ascii=False, indent=2), file=sys.stderr)
+    raise SystemExit(1)
+obj = data.get("obj")
+if isinstance(obj, dict):
+    for key in ("markdown", "md", "content", "text"):
+        value = obj.get(key)
+        if isinstance(value, str):
+            print(value)
+            raise SystemExit(0)
+elif isinstance(obj, str):
+    print(obj)
+    raise SystemExit(0)
+print(json.dumps(data, ensure_ascii=False, indent=2))
+PY
+}
+
+extract_docx_text() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import sys, zipfile, xml.etree.ElementTree as ET
+ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+try:
+    with zipfile.ZipFile(sys.argv[1]) as zf:
+        root = ET.fromstring(zf.read("word/document.xml"))
+    lines = []
+    for para in root.findall(".//w:p", ns):
+        text = "".join(node.text or "" for node in para.findall(".//w:t", ns)).strip()
+        if text:
+            lines.append(text)
+    print("\n".join(lines))
+except Exception as exc:
+    print(f"failed to parse docx: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+export_docx_text() {
+  local token="$1" target="$2"
+  local field payload resp task_id progress download_url tmp
+  field="$(target_json_field "$target")"
+  payload="$(python3 - "$token" "$field" <<'PY'
+import json, sys
+token, field_raw = sys.argv[1:3]
+field = json.loads(field_raw)
+payload = {"access_token": token, "type": "docx"}
+if "file_url" in field:
+    payload["file_url"] = field["file_url"]
+else:
+    payload["file_guid"] = field["guid"]
+print(json.dumps(payload, ensure_ascii=False))
+PY
+)"
+  resp="$(post_json_raw "/openapi/v2/doc/export/async" "$payload")" || return 1
+  ensure_json "$resp" "export doc" || return 1
+  task_id="$(json_value "$resp" obj.task_id)"
+  [ -n "$task_id" ] || die "export response did not include task_id"
+  for _ in $(seq 1 30); do
+    sleep 1
+    progress="$(curl_request "$(base_url)/openapi/v2/doc/export/async/process?access_token=${token}&task_id=${task_id}")" || return 1
+    ensure_json "$progress" "export progress" || return 1
+    download_url="$(python3 - "$progress" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+obj = data.get("obj") or {}
+inner = obj.get("data") or obj
+progress = int(inner.get("progress") or 0)
+if progress >= 100:
+    print(inner.get("download_url") or "")
+PY
+)"
+    [ -z "$download_url" ] || break
+  done
+  [ -n "${download_url:-}" ] || die "export timed out"
+  mkdir -p "$TMP_DIR"
+  tmp="$(mktemp "${TMP_DIR%/}/yach-doc-XXXXXX.docx")"
+  curl_request -L "$download_url" -o "$tmp" >/dev/null
+  extract_docx_text "$tmp"
+  rm -f "$tmp"
+}
+
+show_help() {
+  cat <<'EOF'
+yach - CLI for Zhiyinlou / Yach OpenAPI
+
+Usage:
+  yach init
+  yach doctor [--offline]
+  yach auth status
+  yach config show
+  yach config set default-admin <work_code>
+  yach token
+  yach user <work_code>
+  yach user-id <userid>
+  yach msg <work_code> <content>
+  yach msg-md <work_code> <title> <markdown>
+  yach group-list
+  yach group-msg <group_id> <content>
+  yach group-users <group_id> [page] [count]
+  yach doc-create <name> [type] [--admin <work_code>] [--no-admin] [--collaborator <work_code:role>]
+  yach doc-read <url-or-guid>
+  yach doc-text <url-or-guid>
+  yach doc-append <url-or-guid> <markdown>
+  yach doc-admin-add <url-or-guid> <work_code>
+  yach doc-collaborator-add <url-or-guid> <work_code> [editor|reader|commentator]
+
+Configuration:
+  yach init writes ~/.config/yach/config.json with 0600 permissions.
+  Environment variables override config:
+    YACH_APP_KEY
+    YACH_APP_SECRET
+    YACH_BASE_URL
+    YACH_DEFAULT_ADMIN_WORK_CODE
+
+EOF
+}
+
+cmd_init() {
+  require_bin python3
+  mkdir -p "$CONFIG_DIR"
+  local key secret admin url
+  printf 'Yach app key: '
+  IFS= read -r key
+  printf 'Yach app secret: '
+  stty -echo 2>/dev/null || true
+  IFS= read -r secret
+  stty echo 2>/dev/null || true
+  printf '\n'
+  printf 'Default admin work code (optional): '
+  IFS= read -r admin
+  printf 'Base URL [%s]: ' "$DEFAULT_BASE_URL"
+  IFS= read -r url
+  url="${url:-$DEFAULT_BASE_URL}"
+  [ -n "$key" ] || die "app key is required"
+  [ -n "$secret" ] || die "app secret is required"
+  config_write "app_key=$key" "app_secret=$secret" "default_admin_work_code=$admin" "base_url=$url"
+  rm -f "$TOKEN_CACHE"
+  printf 'Config saved: %s\n' "$CONFIG_FILE"
+}
+
+cmd_config_show() {
+  if [ ! -f "$CONFIG_FILE" ]; then
+    printf 'No config file found: %s\n' "$CONFIG_FILE"
+    return
+  fi
+  python3 - "$CONFIG_FILE" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+if data.get("app_secret"):
+    data["app_secret"] = "***"
+print(json.dumps(data, ensure_ascii=False, indent=2))
+PY
+}
+
+cmd_doctor() {
+  local offline=0
+  [ "${1:-}" = "--offline" ] && offline=1
+  require_bin python3
+  require_bin curl
+  printf 'yach version: %s\n' "$VERSION"
+  printf 'config file: %s\n' "$CONFIG_FILE"
+  [ -n "$(app_key)" ] && printf 'app key: configured\n' || printf 'app key: missing\n'
+  [ -n "$(app_secret)" ] && printf 'app secret: configured\n' || printf 'app secret: missing\n'
+  printf 'base url: %s\n' "$(base_url)"
+  printf 'default admin: %s\n' "$(default_admin_work_code)"
+  if [ "$offline" -eq 1 ]; then
+    printf 'network: skipped\n'
+    return
+  fi
+  get_token >/dev/null
+  printf 'token: ok\n'
+}
+
+cmd_auth_status() {
+  if [ -f "$TOKEN_CACHE" ]; then
+    python3 - "$TOKEN_CACHE" <<'PY'
+import json, sys, time
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+expired = int(data.get("expired_time") or 0)
+print("token_cache: present")
+print("expired_time:", expired)
+print("valid_now:", expired > int(time.time()))
+PY
+  else
+    printf 'token_cache: missing\n'
+  fi
+}
+
+cmd_doc_create() {
+  local name="${1:-}" doc_type="${2:-newdoc}"
+  need_arg "name" "$name"
+  if [[ "$doc_type" == --* ]]; then
+    doc_type="newdoc"
+  else
+    shift || true
+  fi
+  shift || true
+
+  local admin
+  admin="$(default_admin_work_code)"
+  local no_admin=0
+  local collaborators=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --admin)
+        admin="${2:-}"
+        need_arg "--admin" "$admin"
+        shift 2
+        ;;
+      --no-admin)
+        no_admin=1
+        shift
+        ;;
+      --collaborator)
+        need_arg "--collaborator" "${2:-}"
+        collaborators+=("$2")
+        shift 2
+        ;;
+      *)
+        die "unknown option for doc-create: $1"
+        ;;
+    esac
+  done
+
+  local token payload resp target item work_code role
+  token="$(get_token)"
+  payload="$(python3 - "$token" "$name" "$doc_type" <<'PY'
+import json, sys
+token, name, doc_type = sys.argv[1:4]
+print(json.dumps({"access_token": token, "name": name, "type": doc_type}, ensure_ascii=False))
+PY
+)"
+  resp="$(post_json_raw "/openapi/v2/doc/add?access_token=${token}" "$payload")" || return 1
+  ensure_json "$resp" "create doc" || return 1
+  printf '%s' "$resp" | pretty_json
+  target="$(extract_doc_target "$resp")"
+  [ -n "$target" ] || die "document created but response did not include url/file_url/guid"
+
+  if [ "$no_admin" -eq 0 ] && [ -n "$admin" ]; then
+    printf 'Adding document admin: %s\n' "$admin" >&2
+    if ! add_doc_admin "$token" "$target" "$admin" >/dev/null; then
+      printf 'Document was created, but adding admin failed.\n' >&2
+      printf 'Run manually: yach doc-admin-add %s %s\n' "$(json_quote "$target")" "$admin" >&2
+      return 1
+    fi
+  fi
+
+  for item in "${collaborators[@]}"; do
+    work_code="${item%%:*}"
+    role="${item#*:}"
+    [ "$role" != "$item" ] || role="editor"
+    case "$role" in editor|reader|commentator) ;; *) die "invalid collaborator role: $role" ;; esac
+    printf 'Adding document collaborator: %s (%s)\n' "$work_code" "$role" >&2
+    if ! add_doc_collaborator "$token" "$target" "$work_code" "$role" >/dev/null; then
+      printf 'Document was created, but adding collaborator failed.\n' >&2
+      printf 'Run manually: yach doc-collaborator-add %s %s %s\n' "$(json_quote "$target")" "$work_code" "$role" >&2
+      return 1
+    fi
+  done
+}
+
+cmd_doc_read() {
+  local target="${1:-}" token url resp
+  need_arg "url-or-guid" "$target"
+  token="$(get_token)"
+  if [[ "$target" == http* ]]; then
+    url="$(python3 - "$(base_url)" "$token" "$target" <<'PY'
+import sys, urllib.parse
+base, token, target = sys.argv[1:4]
+print(f"{base}/openapi/v2/doc/content/md?access_token={urllib.parse.quote(token)}&file_url={urllib.parse.quote(target, safe='')}")
+PY
+)"
+  else
+    url="$(base_url)/openapi/v2/doc/content?access_token=${token}&guid=${target}"
+  fi
+  resp="$(curl_request "$url")" || return 1
+  if print_doc_content "$resp"; then
+    return
+  fi
+  printf 'Content API failed; trying docx export fallback...\n' >&2
+  export_docx_text "$token" "$target"
+}
+
+cmd_doc_text() {
+  local target="${1:-}" token url resp
+  need_arg "url-or-guid" "$target"
+  token="$(get_token)"
+  if [[ "$target" == http* ]]; then
+    url="$(python3 - "$(base_url)" "$token" "$target" <<'PY'
+import sys, urllib.parse
+base, token, target = sys.argv[1:4]
+print(f"{base}/openapi/v2/doc/content?access_token={urllib.parse.quote(token)}&file_url={urllib.parse.quote(target, safe='')}")
+PY
+)"
+  else
+    url="$(base_url)/openapi/v2/doc/content?access_token=${token}&guid=${target}"
+  fi
+  resp="$(curl_request "$url")" || return 1
+  print_doc_content "$resp"
+}
+
+cmd_doc_append() {
+  local target="${1:-}" content="${2:-}" token field payload
+  need_arg "url-or-guid" "$target"
+  need_arg "markdown" "$content"
+  token="$(get_token)"
+  field="$(target_json_field "$target")"
+  payload="$(python3 - "$token" "$field" "$content" <<'PY'
+import json, sys
+token, field_raw, content = sys.argv[1:4]
+payload = {"access_token": token, "content": content}
+payload.update(json.loads(field_raw))
+print(json.dumps(payload, ensure_ascii=False))
+PY
+)"
+  post_json_raw "/openapi/v2/doc/content/append" "$payload" | pretty_json
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    -h|--help|help) show_help ;;
+    -v|--version|version) printf '%s\n' "$VERSION" ;;
+    init) cmd_init ;;
+    doctor) cmd_doctor "$@" ;;
+    auth)
+      case "${1:-}" in
+        status) cmd_auth_status ;;
+        *) die "usage: yach auth status" ;;
+      esac
+      ;;
+    config)
+      case "${1:-}" in
+        show) cmd_config_show ;;
+        set)
+          [ "${2:-}" = "default-admin" ] || die "usage: yach config set default-admin <work_code>"
+          need_arg "work_code" "${3:-}"
+          config_write "default_admin_work_code=$3"
+          ;;
+        *) die "usage: yach config show | yach config set default-admin <work_code>" ;;
+      esac
+      ;;
+    token) get_token ;;
+    msg)
+      need_arg "work_code" "${1:-}"
+      need_arg "content" "${2:-}"
+      token="$(get_token)"
+      message="$(python3 - "${2:-}" <<'PY'
+import json, sys
+print(json.dumps({"msgtype": "text", "text": {"content": sys.argv[1]}}, ensure_ascii=False))
+PY
+)"
+      post_form "/v1/single/message/send" \
+        --data-urlencode "access_token=${token}" \
+        --data-urlencode "to_work_code=$1" \
+        --data-urlencode "message=${message}"
+      ;;
+    msg-md)
+      need_arg "work_code" "${1:-}"
+      need_arg "title" "${2:-}"
+      need_arg "markdown" "${3:-}"
+      token="$(get_token)"
+      message="$(python3 - "$2" "$3" <<'PY'
+import json, sys
+print(json.dumps({"msgtype": "markdown", "markdown": {"title": sys.argv[1], "text": sys.argv[2]}}, ensure_ascii=False))
+PY
+)"
+      post_form "/v1/single/message/send" \
+        --data-urlencode "access_token=${token}" \
+        --data-urlencode "to_work_code=$1" \
+        --data-urlencode "message=${message}"
+      ;;
+    group-list)
+      token="$(get_token)"
+      curl_request "$(base_url)/openapi/v2/dify/robot/groups?access_token=${token}" | pretty_json
+      ;;
+    group-msg)
+      need_arg "group_id" "${1:-}"
+      need_arg "content" "${2:-}"
+      token="$(get_token)"
+      message="$(python3 - "$2" <<'PY'
+import json, sys
+print(json.dumps({"msgtype": "text", "text": {"content": sys.argv[1]}}, ensure_ascii=False))
+PY
+)"
+      post_form "/group/robot/message/send" \
+        --data-urlencode "access_token=${token}" \
+        --data-urlencode "group_id=$1" \
+        --data-urlencode "message=${message}"
+      ;;
+    group-users)
+      need_arg "group_id" "${1:-}"
+      token="$(get_token)"
+      post_form "/group/users/list" \
+        --data-urlencode "access_token=${token}" \
+        --data-urlencode "group_tid=$1" \
+        --data-urlencode "page=${2:-1}" \
+        --data-urlencode "count=${3:-100}"
+      ;;
+    user)
+      need_arg "work_code" "${1:-}"
+      token="$(get_token)"
+      curl_request "$(base_url)/user/get_by_workcode?access_token=${token}&work_code=$1" | pretty_json
+      ;;
+    user-id)
+      need_arg "userid" "${1:-}"
+      token="$(get_token)"
+      curl_request "$(base_url)/user/get?access_token=${token}&userid=$1" | pretty_json
+      ;;
+    doc-create) cmd_doc_create "$@" ;;
+    doc-read) cmd_doc_read "$@" ;;
+    doc-text) cmd_doc_text "$@" ;;
+    doc-append) cmd_doc_append "$@" ;;
+    doc-admin-add)
+      need_arg "url-or-guid" "${1:-}"
+      need_arg "work_code" "${2:-}"
+      token="$(get_token)"
+      add_doc_admin "$token" "$1" "$2"
+      ;;
+    doc-collaborator-add)
+      need_arg "url-or-guid" "${1:-}"
+      need_arg "work_code" "${2:-}"
+      case "${3:-editor}" in editor|reader|commentator) ;; *) die "invalid role: ${3:-}" ;; esac
+      token="$(get_token)"
+      add_doc_collaborator "$token" "$1" "$2" "${3:-editor}"
+      ;;
+    *) die "unknown command: $cmd. Run: yach --help" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,17 @@
+.DS_Store
+
+# Local credentials and runtime state
+.env
+.env.*
+!.env.example
+config.json
+token.json
+
+# Logs and temp files
+*.log
+tmp/
+temp/
+
+# Editor state
+.idea/
+.vscode/
