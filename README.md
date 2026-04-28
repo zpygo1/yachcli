@@ -159,7 +159,7 @@ export YACH_BASE_URL="https://yach-oapi.zhiyinlou.com"
 | 命令 | 能力 |
 |---|---|
 | `yach doc-create <名称> [类型]` | 创建在线文档 |
-| `yach doc-read <URL或guid>` | 读取在线文档内容，优先读取 Markdown，失败时尝试导出 docx 后提取文本 |
+| `yach doc-read <URL或guid>` | 读取在线文档内容，优先调用 Markdown 内容接口，失败时尝试导出 docx 后提取文本 |
 | `yach doc-text <URL或guid>` | 读取在线文档纯文本内容 |
 | `yach doc-append <URL或guid> <Markdown内容>` | 向在线文档追加 Markdown 内容 |
 | `yach doc-admin-add <URL或guid> <工号>` | 给文档添加管理员 |
@@ -242,6 +242,8 @@ yach doc-create "周会纪要" newdoc --admin <你的工号>
 ```bash
 yach doc-read "https://yach-doc-shimo.zhiyinlou.com/docs/xxxx"
 ```
+
+说明：`doc-read` 使用知音楼官方 `GET /openapi/v2/doc/content/md` 接口优先读取 Markdown。该接口需要在数字伙伴开发者选项中开启对应 API 权限；官方同时说明，图片内容较多的文档即使已开通权限，也可能返回 `61000158 没有权限`。CLI 遇到这种情况会自动回退到 docx 导出并提取文本。
 
 追加内容：
 

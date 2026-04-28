@@ -319,6 +319,19 @@ print(json.dumps(data, ensure_ascii=False, indent=2))
 PY
 }
 
+doc_content_error_code() {
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit(0)
+code = data.get("code")
+if code is not None:
+    print(code)
+PY
+}
+
 extract_docx_text() {
   local file="$1"
   python3 - "$file" <<'PY'
@@ -582,6 +595,9 @@ PY
   resp="$(curl_request "$url")" || return 1
   if print_doc_content "$resp"; then
     return
+  fi
+  if [[ "$(doc_content_error_code "$resp")" == "61000158" ]]; then
+    printf 'Markdown Content API returned 61000158. Zhiyinlou documents with many images may return this even when Markdown permission is enabled.\n' >&2
   fi
   printf 'Content API failed; trying docx export fallback...\n' >&2
   export_docx_text "$token" "$target"
