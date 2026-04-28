@@ -2,7 +2,7 @@
 set -euo pipefail
 
 INSTALL_DIR="${YACH_INSTALL_DIR:-$HOME/.local/bin}"
-YACH_REPO="${YACH_REPO:-your-org/yach-cli}"
+YACH_REPO="${YACH_REPO:-zpygo1/yachcli}"
 SOURCE_URL="${YACH_SOURCE_URL:-https://raw.githubusercontent.com/$YACH_REPO/main/bin/yach}"
 
 mkdir -p "$INSTALL_DIR"
